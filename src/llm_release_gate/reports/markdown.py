@@ -4,25 +4,35 @@ next, full metric table after, identity block last."""
 
 from __future__ import annotations
 
+import html
+import re
+
 from . import HEURISTIC_FOOTNOTE, fmt_delta, fmt_value, is_heuristic, verdict_word
 
 _VERDICT_ICON = {"pass": "✅", "fail": "❌", "warn": "⚠️", "skipped": "⏭️"}
+
+
+def _escape_cell(text: str) -> str:
+    text = html.escape(str(text), quote=False)
+    text = re.sub(r"[\\`*\[\]{}#!|]|(?<!\w)_|_(?!\w)", lambda m: f"&#{ord(m[0])};", text)
+    return (text.replace("@", "@\u200b").replace("\r\n", "<br/>")
+            .replace("\n", "<br/>").replace("\r", "<br/>"))
 
 
 def render_markdown(report: dict) -> str:
     gate = report["gate"]
     inputs = report["inputs"]
     runs = report["runs"]
-    icon = _VERDICT_ICON[gate["verdict"]]
+    icon = _VERDICT_ICON.get(gate["verdict"], "❓")
     lines: list[str] = []
     heuristic_used = False
 
     lines.append(f"## {icon} llm-release-gate: **{verdict_word(gate['verdict'])}**")
     lines.append("")
     lines.append(
-        f"`{inputs['baseline_config']['name']}` ({inputs['baseline_config']['model']}) vs "
-        f"`{inputs['candidate_config']['name']}` ({inputs['candidate_config']['model']}) "
-        f"on dataset **{inputs['dataset']['name']}** v{inputs['dataset']['version']} "
+        f"<code>{_escape_cell(inputs['baseline_config']['name'])}</code> ({_escape_cell(inputs['baseline_config']['model'])}) vs "
+        f"<code>{_escape_cell(inputs['candidate_config']['name'])}</code> ({_escape_cell(inputs['candidate_config']['model'])}) "
+        f"on dataset **{_escape_cell(inputs['dataset']['name'])}** v{_escape_cell(inputs['dataset']['version'])} "
         f"({inputs['dataset']['n_items']} items, task: {inputs['dataset']['task']})"
     )
     lines.append("")
@@ -34,11 +44,11 @@ def render_markdown(report: dict) -> str:
         for rule in breached:
             rule_icon = _VERDICT_ICON[rule["verdict"]]
             implicit = " *(implicit default rule)*" if rule["implicit"] else ""
-            lines.append(f"- {rule_icon} **{rule['metric']}**: {rule['message']}{implicit}")
+            lines.append(f"- {rule_icon} **{_escape_cell(rule['metric'])}**: {_escape_cell(rule['message'])}{implicit}")
         lines.append("")
 
     for notice in gate["notices"]:
-        lines.append(f"> ⚠️ {notice}")
+        lines.append(f"> ⚠️ {_escape_cell(notice)}")
     if gate["notices"]:
         lines.append("")
 
@@ -65,23 +75,26 @@ def render_markdown(report: dict) -> str:
                 cells[side] = f"{fmt_value(m)} ({m['note']})"
             else:
                 cells[side] = fmt_value(m)
-        b_txt, c_txt = cells["b"], cells["c"]
+        b_txt, c_txt = _escape_cell(cells["b"]), _escape_cell(cells["c"])
         gate_cells = [
-            f"{_VERDICT_ICON[r['verdict']]} {verdict_word(r['verdict'])}"
+            f"{_VERDICT_ICON.get(r['verdict'], '❓')} {verdict_word(r['verdict'])}"
             for r in rules_by_metric.get(key, [])
         ]
-        gate_cell = ", ".join(gate_cells) if gate_cells else "—"
-        lines.append(f"| {key}{mark} | {b_txt} | {c_txt} | {fmt_delta(entry)} | {gate_cell} |")
+        gate_cell = _escape_cell(", ".join(gate_cells) if gate_cells else "—")
+        delta_txt = _escape_cell(fmt_delta(entry))
+        lines.append(f"| {_escape_cell(key)}{mark} | {b_txt} | {c_txt} | {delta_txt} | {gate_cell} |")
     lines.append("")
     if heuristic_used:
         lines.append(f"† {HEURISTIC_FOOTNOTE}.")
         lines.append("")
 
     b, c = runs["baseline"], runs["candidate"]
+    b_errors = "item-processing errors" if b.get("n_processing_errors") else "provider errors"
+    c_errors = "item-processing errors" if c.get("n_processing_errors") else "provider errors"
     lines.append(
         f"Samples: baseline answered {b['n_ok']}/{b['n_items']} items "
-        f"({b['n_errors']} provider errors); candidate answered {c['n_ok']}/{c['n_items']} "
-        f"({c['n_errors']} provider errors). Rates are computed over applicable, "
+        f"({b['n_errors']} {b_errors}); candidate answered {c['n_ok']}/{c['n_items']} "
+        f"({c['n_errors']} {c_errors}). Rates are computed over applicable, "
         f"answered items only — see per-metric counts above."
     )
     lines.append("")
@@ -95,7 +108,7 @@ def render_markdown(report: dict) -> str:
     lines.append(f"- thresholds: `{inputs['thresholds']['sha256']}`")
     pricing = inputs["pricing_table"]
     if pricing["sha256"]:
-        lines.append(f"- pricing table: v{pricing['version']} `{pricing['sha256']}`")
+        lines.append(f"- pricing table: v{_escape_cell(pricing['version'])} `{pricing['sha256']}`")
     else:
         lines.append("- pricing table: none supplied (cost reported unavailable)")
     lines.append(f"- result: `{report['result_hash']}`")

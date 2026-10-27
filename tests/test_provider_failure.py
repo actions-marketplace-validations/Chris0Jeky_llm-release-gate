@@ -111,7 +111,7 @@ def test_baseline_provider_error_notice_is_reported_everywhere(mini_gate):
     degraded["r2"] = {"error": "baseline upstream timeout"}
     paths = mini_gate(baseline_responses=degraded)
 
-    assert main(gate_argv(paths)) == 0
+    assert main(gate_argv(paths)) == 1  # relative rules cannot compare unlike cohorts
     report = json.loads(open(f"{paths['out']}/report.json", encoding="utf-8").read())
     notice = (
         "baseline run had 1/3 provider errors; baseline aggregates cover only the answered items"
@@ -141,3 +141,19 @@ def test_run_continues_when_every_item_fails(mini_gate):
         assert latency["available"] is False
         assert latency["value"] is None
         assert latency["note"] == "provider reported no latency"
+
+
+@pytest.mark.parametrize("entry", [
+    {"text": 123}, {"text": None}, {}, {"error": None}, {"error": 123},
+    {"text": "ok", "error": None}, {"text": None, "error": "timeout"},
+])
+@pytest.mark.parametrize("max_error_rate", [0.0, 1.0])
+def test_malformed_fixture_content_exits_config_error(mini_gate, capsys, entry, max_error_rate):
+    paths = mini_gate(
+        candidate_responses=dict(GOOD_RESPONSE, r1=entry),
+        thresholds={"rules": [{"metric": "errors.error_rate", "max_value": max_error_rate}]},
+    )
+    assert main(gate_argv(paths)) == 2
+    error = capsys.readouterr().err
+    assert "model 'm-cand'" in error and "item 'r1'" in error
+    assert "Traceback" not in error

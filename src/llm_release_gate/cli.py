@@ -22,16 +22,20 @@ import traceback
 
 from . import TOOL_NAME, __version__
 from .errors import GateConfigError
+from .bundles import build_bundle_receipt, DEFAULT_MAX_BYTES
 from .gate import build_report
+from .github_io import emit_outputs, emit_summary, validate_command_files
 from .hashing import file_sha256
 from .loading import (
     load_dataset, load_pricing, load_run_config, load_scorer_config,
-    load_thresholds, no_pricing,
+    load_thresholds, no_pricing, input_byte_limit, RunConfig, capture_input_sources,
 )
 from .manifest import build_manifest
+from .outputs import publish_documents
 from .reports.html import render_html
 from .reports.markdown import render_markdown
 from .runner import run_config
+from .requests import BINDING_SCHEME
 from .scorers import build_scorers
 
 EXIT_PASS = 0
@@ -39,33 +43,42 @@ EXIT_GATE_FAIL = 1
 EXIT_ERROR = 2
 
 
+def _log(text: str, *, file=None) -> None:
+    # Runner commands are parsed from both streams, even inside exception text.
+    print(text.replace("\r", "\\r").replace("\n", "\\n").replace("::", r"\x3a\x3a"), file=file)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        if message:
+            super()._print_message(message.replace("::", r"\x3a\x3a"), file)
+
+
 def _write(path: str, content: str) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(content)
+    publish_documents({path: content})
 
 
-def _emit_github_outputs(pairs: dict) -> None:
-    output_path = os.environ.get("GITHUB_OUTPUT")
-    if not output_path:
-        return
-    with open(output_path, "a", encoding="utf-8") as fh:
-        for key, value in pairs.items():
-            fh.write(f"{key}={value}\n")
+def _emit_github_outputs(pairs: dict, report_paths=()) -> None:
+    emit_outputs(pairs, report_paths)
 
 
-def _emit_github_summary(markdown: str) -> None:
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not summary_path:
-        return
-    with open(summary_path, "a", encoding="utf-8") as fh:
-        fh.write(markdown + "\n")
+def _emit_github_summary(markdown: str, report_paths=()) -> None:
+    emit_summary(markdown, report_paths)
+
+
+def _require_binding(config: RunConfig, required: bool) -> None:
+    if required and (config.provider != "fake" or
+                     config.provider_options.get("request_binding") != BINDING_SCHEME):
+        raise GateConfigError("--require-request-binding requires fake provider "
+                              "request_binding='sha256-v1' on every run config")
 
 
 def _cmd_gate(args: argparse.Namespace) -> int:
     dataset = load_dataset(args.dataset)
     baseline_cfg = load_run_config(args.baseline, "baseline")
     candidate_cfg = load_run_config(args.candidate, "candidate")
+    _require_binding(baseline_cfg, args.require_request_binding)
+    _require_binding(candidate_cfg, args.require_request_binding)
     scorer_cfg = load_scorer_config(args.scorers)
     thresholds = load_thresholds(args.thresholds)
     pricing = load_pricing(args.pricing) if args.pricing else no_pricing()
@@ -87,9 +100,11 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         "report_html": os.path.join(out_dir, "report.html"),
         "manifest": os.path.join(out_dir, "manifest.json"),
     }
-    _write(files["report_json"], json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-    _write(files["report_md"], markdown)
-    _write(files["report_html"], render_html(report))
+    documents = {
+        files["report_json"]: json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+        files["report_md"]: markdown,
+        files["report_html"]: render_html(report),
+    }
     manifest = build_manifest(
         report, dataset, baseline_cfg, candidate_cfg, scorer_cfg, thresholds, pricing,
         provider_infos={
@@ -98,10 +113,48 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         },
         report_files=files,
     )
-    _write(files["manifest"], json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    execution_options = {}
+    if args.max_input_bytes is not None:
+        execution_options["max_input_bytes"] = args.max_input_bytes
+    if args.require_request_binding:
+        execution_options["require_request_binding"] = True
+    if execution_options:
+        manifest["execution_options"] = execution_options
+    manifest["bundle_integrity"] = build_bundle_receipt(manifest, {
+        os.path.basename(path): content.encode("utf-8") for path, content in documents.items()
+    })
+    documents[files["manifest"]] = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+    validate_command_files(files.values())
+    publish_documents(documents)
 
     verdict = report["gate"]["verdict"]
     exit_code = EXIT_PASS if verdict == "pass" else EXIT_GATE_FAIL
+
+    delivery_failure = (f"{TOOL_NAME}: gate {verdict.upper()} (threshold verdict), "
+                        f"but output delivery failed: exit {EXIT_ERROR}")
+    delivery_error = None
+    try:
+        _emit_github_outputs({
+            "verdict": verdict,
+            "exit-code": str(exit_code),
+            "result-hash": report["result_hash"],
+            "bundle-hash": manifest["bundle_integrity"]["bundle_hash"],
+            "report-json": files["report_json"],
+            "report-md": files["report_md"],
+            "report-html": files["report_html"],
+        }, files.values())
+    except GateConfigError as exc:
+        delivery_error = exc
+    try:
+        _emit_github_summary(
+            f"> {delivery_failure}\n\n{markdown}" if delivery_error else markdown,
+            files.values(),
+        )
+    except GateConfigError as exc:
+        delivery_error = exc
+    if delivery_error:
+        print(delivery_failure)
+        raise delivery_error
 
     print(f"{TOOL_NAME}: gate {verdict.upper()}")
     print(
@@ -110,21 +163,13 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     )
     for rule in report["rules"]:
         if rule["verdict"] in ("fail", "warn"):
-            print(f"  [{rule['verdict'].upper()}] {rule['metric']}: {rule['message']}")
+            _log(f"  [{rule['verdict'].upper()}] {json.dumps(rule['metric'])}: {json.dumps(rule['message'], ensure_ascii=False)}")
     for notice in report["gate"]["notices"]:
-        print(f"  note: {notice}")
+        _log(f"  note: {json.dumps(notice, ensure_ascii=False)}")
     print(f"  result hash: {report['result_hash']}")
-    print(f"  reports: {files['report_json']}, {files['report_md']}, {files['report_html']}")
+    print(f"  bundle hash: {manifest['bundle_integrity']['bundle_hash']}")
+    _log(f"  reports: {files['report_json']}, {files['report_md']}, {files['report_html']}")
 
-    _emit_github_summary(markdown)
-    _emit_github_outputs({
-        "verdict": verdict,
-        "exit-code": str(exit_code),
-        "result-hash": report["result_hash"],
-        "report-json": files["report_json"],
-        "report-md": files["report_md"],
-        "report-html": files["report_html"],
-    })
     return exit_code
 
 
@@ -133,6 +178,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     a side before wiring up a full gate."""
     dataset = load_dataset(args.dataset)
     cfg = load_run_config(args.config, "config")
+    _require_binding(cfg, args.require_request_binding)
     scorer_cfg = load_scorer_config(args.scorers)
     pricing = load_pricing(args.pricing) if args.pricing else no_pricing()
     scorers = build_scorers(scorer_cfg)
@@ -147,21 +193,100 @@ def _cmd_run(args: argparse.Namespace) -> int:
     }
     out_path = os.path.join(args.out, "run.json")
     _write(out_path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-    print(f"{TOOL_NAME}: ran '{cfg.name}' on {result.n_items} items "
+    _log(f"{TOOL_NAME}: ran '{cfg.name}' on {result.n_items} items "
           f"({result.n_ok} ok, {result.n_errors} errors) -> {out_path}")
+    if args.fail_on_errors and result.n_errors:
+        _log(f"{TOOL_NAME}: --fail-on-errors: {result.n_errors} item(s) failed; "
+              f"diagnostics retained in {out_path}", file=sys.stderr)
+        return EXIT_ERROR
     return EXIT_PASS
+
+
+def _cmd_plan(args: argparse.Namespace) -> int:
+    from .planning import build_request_plan
+
+    dataset = load_dataset(args.dataset)
+    config = load_run_config(args.config, "config")
+    plan = build_request_plan(dataset, config)
+    content = json.dumps(plan, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    out_path = os.path.join(args.out, "plan.json")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        # A plan must never replace an input or silently overwrite another receipt.
+        with open(out_path, "x", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+    except OSError as exc:
+        raise GateConfigError(f"plan output could not be created: {out_path} ({exc})") from exc
+    print(f"{TOOL_NAME}: planned {len(plan['requests'])} requests; no provider calls")
+    print(f"  plan hash: {plan['plan_hash']}")
+    _log(f"  plan: {out_path}")
+    return EXIT_PASS
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    from .bundles import verify_bundle
+
+    proof = verify_bundle(args.bundle, expected_result_hash=args.expected_result_hash,
+                          expected_bundle_hash=args.expected_bundle_hash,
+                          max_input_bytes=args.max_input_bytes)
+    if args.json_output:
+        print(json.dumps(proof, indent=2, ensure_ascii=False, allow_nan=False).replace("::", r"\u003a\u003a"))
+    else:
+        print(f"{TOOL_NAME}: bundle integrity VERIFIED")
+        print(f"  recorded gate verdict: {proof['gate_verdict'].upper()} (not re-evaluated)")
+        print(f"  result hash: {proof['result_hash']}")
+        print(f"  bundle hash: {proof['bundle_hash']}")
+        print("  Content consistency is not proof of model execution or producer authenticity.")
+    return EXIT_GATE_FAIL if args.require_pass and proof['gate_verdict'] != 'pass' else EXIT_PASS
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    from .audit import audit_bundle
+
+    receipt = audit_bundle(args.bundle, args.thresholds,
+        expected_result_hash=args.expected_result_hash,
+        expected_bundle_hash=args.expected_bundle_hash,
+        expected_policy_hash=args.expected_policy_hash,
+        max_input_bytes=args.max_input_bytes)
+    if args.json_output:
+        print(json.dumps(receipt, indent=2, ensure_ascii=False, allow_nan=False).replace("::", r"\u003a\u003a"))
+    else:
+        print(f"{TOOL_NAME}: consumer policy {receipt['policy_verdict'].upper()}")
+        print(f"  recorded gate verdict: {receipt['recorded_gate_verdict'].upper()}")
+        print(f"  rules: {receipt['n_rules']}, failed: {receipt['n_failed']}, warned: {receipt['n_warned']}")
+        for rule in receipt['rules']:
+            if rule['verdict'] in ('fail', 'warn'):
+                _log(f"  [{rule['verdict'].upper()}] {json.dumps(rule['metric'], ensure_ascii=False)}: "
+                      f"{json.dumps(rule['message'], ensure_ascii=False)}")
+        print(f"  result hash: {receipt['result_hash']}")
+        print(f"  bundle hash: {receipt['bundle_hash']}")
+        print(f"  policy hash: {receipt['policy_hash']}")
+        print(f"  audit hash: {receipt['audit_hash']}")
+        print("  Stored aggregates only; source truth, scoring and authenticity were not verified.")
+    return EXIT_PASS if receipt['policy_verdict'] == 'pass' else EXIT_GATE_FAIL
 
 
 def _cmd_hash(args: argparse.Namespace) -> int:
     for path in args.files:
         if not os.path.isfile(path):
             raise GateConfigError(f"file not found: {path}")
-        print(f"{file_sha256(path)}  {path}")
+        _log(f"{file_sha256(path)}  {path}")
     return EXIT_PASS
 
 
+
+def _positive_bytes(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = 0
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("max input bytes must be a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog=TOOL_NAME,
         description="Block unsafe LLM app changes: compare a candidate config "
                     "against the baseline over a golden dataset and fail on regression.",
@@ -177,6 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--thresholds", required=True, help="thresholds JSON")
     gate.add_argument("--pricing", help="pricing-table JSON (omit: cost reported unavailable)")
     gate.add_argument("--out", default="out", help="output directory (default: out)")
+    gate.add_argument("--max-input-bytes", type=_positive_bytes,
+                      help="maximum raw bytes per JSON input, including fixtures (default: unlimited)")
+    gate.add_argument("--require-request-binding", action="store_true",
+                      help="require sha256-v1 bound replay in both configs (default: not required)")
     gate.set_defaults(func=_cmd_gate)
 
     run = sub.add_parser("run", help="run one config over the dataset (fixture debugging)")
@@ -185,7 +314,42 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--scorers", required=True)
     run.add_argument("--pricing")
     run.add_argument("--out", default="out")
+    run.add_argument("--max-input-bytes", type=_positive_bytes,
+                     help="maximum raw bytes per JSON input, including fixtures (default: unlimited)")
+    run.add_argument("--fail-on-errors", action="store_true",
+                     help="exit 2 if any item fails, after writing run.json (default: diagnostic exit 0)")
+    run.add_argument("--require-request-binding", action="store_true",
+                     help="require sha256-v1 bound replay in the run config")
     run.set_defaults(func=_cmd_run)
+
+    verify = sub.add_parser("verify", help="verify a report bundle offline, without re-running a gate")
+    verify.add_argument("--bundle", required=True, help="directory containing the four report artifacts")
+    verify.add_argument("--expected-result-hash", help="trusted external report content hash")
+    verify.add_argument("--expected-bundle-hash", help="trusted external hash including manifest and artifact bytes")
+    verify.add_argument("--require-pass", action="store_true", help="exit 1 for intact evidence recording a failed gate")
+    verify.add_argument("--json", dest="json_output", action="store_true", help="print a machine-readable verification receipt")
+    verify.add_argument("--max-input-bytes", type=_positive_bytes, default=DEFAULT_MAX_BYTES,
+                        help="maximum raw bytes per artifact (default: 16777216)")
+    verify.set_defaults(func=_cmd_verify)
+
+    audit = sub.add_parser("audit", help="apply a supplied policy to verified stored aggregates")
+    audit.add_argument("--bundle", required=True, help="directory containing the four report artifacts")
+    audit.add_argument("--thresholds", required=True, help="explicit consumer threshold-policy JSON")
+    audit.add_argument("--expected-result-hash", help="trusted external report content hash")
+    audit.add_argument("--expected-bundle-hash", help="trusted external invocation bundle hash")
+    audit.add_argument("--expected-policy-hash", help="trusted SHA-256 of exact policy file bytes")
+    audit.add_argument("--json", dest="json_output", action="store_true", help="print the audit receipt as JSON")
+    audit.add_argument("--max-input-bytes", type=_positive_bytes, default=DEFAULT_MAX_BYTES,
+                       help="maximum raw bytes per policy or artifact (default: 16777216)")
+    audit.set_defaults(func=_cmd_audit)
+
+    plan = sub.add_parser("plan", help="fingerprint rendered requests without calling a provider")
+    plan.add_argument("--dataset", required=True, help="golden dataset JSON")
+    plan.add_argument("--config", required=True, help="run-config JSON to render")
+    plan.add_argument("--out", default="out", help="directory for a new plan.json (never overwritten)")
+    plan.add_argument("--max-input-bytes", type=_positive_bytes,
+                      help="maximum raw bytes per JSON input (default: unlimited)")
+    plan.set_defaults(func=_cmd_plan)
 
     hash_cmd = sub.add_parser("hash", help="print sha256 content hashes for files")
     hash_cmd.add_argument("files", nargs="+")
@@ -198,12 +362,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return args.func(args)
+        with capture_input_sources(), input_byte_limit(getattr(args, "max_input_bytes", None)):
+            return args.func(args)
     except GateConfigError as exc:
-        print(f"{TOOL_NAME}: configuration error: {exc}", file=sys.stderr)
+        _log(f"{TOOL_NAME}: configuration error: {exc}", file=sys.stderr)
         return EXIT_ERROR
     except Exception:  # never let a crash masquerade as a gate verdict
-        traceback.print_exc()
+        for line in traceback.format_exc().splitlines():
+            _log(line, file=sys.stderr)
         print(f"{TOOL_NAME}: internal error (see traceback above)", file=sys.stderr)
         return EXIT_ERROR
 

@@ -3,7 +3,7 @@
 
 PY ?= python
 
-.PHONY: install test demo-green demo-red demo ci clean
+.PHONY: install test demo-green demo-red demo demo-bound verify-demo ci clean
 
 install:
 	$(PY) -m pip install -e ".[dev]"
@@ -53,7 +53,15 @@ demo-red:
 
 demo: demo-green demo-red
 
-ci: test demo
+demo-bound:
+	$(PY) scripts/check_request_binding.py
+
+verify-demo: demo demo-bound
+	@for example in rag-support-bot extraction-api assistant-cheap-regression request-bound-replay; do \
+	  $(PY) -m llm_release_gate verify --bundle out/$$example --json || exit $$?; \
+	done
+
+ci: test verify-demo
 
 clean:
 	rm -rf out .pytest_cache

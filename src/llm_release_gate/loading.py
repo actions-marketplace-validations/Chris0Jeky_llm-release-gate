@@ -10,7 +10,12 @@ gate must never silently pass.
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -18,15 +23,116 @@ from .errors import GateConfigError
 from .hashing import json_source_sha256
 
 
-def _load_json_file(path: str, what: str) -> tuple[Any, str]:
-    if not os.path.isfile(path):
-        raise GateConfigError(f"{what} file not found: {path}")
+
+# Context-local rather than process-global: nested calls and later CLI invocations
+# must not inherit a prior caller's limit. Provider factory signatures stay stable.
+_INPUT_BYTE_LIMIT: ContextVar[Optional[int]] = ContextVar("input_byte_limit", default=None)
+
+
+@contextmanager
+def input_byte_limit(max_bytes: Optional[int]) -> Iterator[None]:
+    """Bound each JSON source read in this context; None preserves legacy behavior.
+
+    This is a per-file raw-byte limit, not a total-run or parsed-object memory cap.
+    The runner is synchronous; out-of-tree worker threads must set their own scope.
+    """
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
+        raise GateConfigError("max input bytes must be a positive integer")
+    token = _INPUT_BYTE_LIMIT.set(max_bytes)
     try:
-        with open(path, "rb") as fh:
-            source = fh.read()
-        data = json.loads(source.decode("utf-8"))
+        yield
+    finally:
+        _INPUT_BYTE_LIMIT.reset(token)
+
+
+def _read_json_source(fh, path: str, what: str) -> bytes:
+    limit = _INPUT_BYTE_LIMIT.get()
+    if limit is None:
+        return fh.read()
+    # Read at most limit+1 bytes, in bounded chunks, from the already verified
+    # descriptor. Do not trust a prior path stat (or allocate 'limit' bytes up front).
+    chunks = []
+    remaining = limit + 1
+    while remaining:
+        chunk = fh.read(min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if remaining == 0:
+        raise GateConfigError(f"{what} {path}: exceeds max input size of {limit} bytes")
+    return b"".join(chunks)
+
+
+
+# Capture actual opened file identities only for the lifetime of a CLI invocation.
+# This also covers fixtures read indirectly by providers without changing their API.
+_INPUT_SOURCES: ContextVar[list[tuple[str, int, int]] | None] = ContextVar(
+    "input_sources", default=None,
+)
+
+
+@contextmanager
+def capture_input_sources() -> Iterator[None]:
+    token = _INPUT_SOURCES.set([])
+    try:
+        yield
+    finally:
+        _INPUT_SOURCES.reset(token)
+
+
+def loaded_input_sources() -> tuple[tuple[str, int, int], ...]:
+    return tuple(_INPUT_SOURCES.get() or ())
+
+
+def _open_regular_file(path: str, flags: int) -> int:
+    # On POSIX, opening a FIFO can block before fstat can inspect it. Nonblocking
+    # open has no effect on regular files; inspect the actual descriptor so a
+    # symlink or path replacement cannot bypass the check.
+    fd = os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("expected a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _duplicate_free_object(pairs: list[tuple[str, Any]], path: str, what: str) -> dict:
+    obj: dict = {}
+    for key, value in pairs:
+        if key in obj:
+            raise GateConfigError(f"{what} {path}: duplicate key '{key}'")
+        obj[key] = value
+    return obj
+
+
+def _load_json_file(path: str, what: str) -> tuple[Any, str]:
+    try:
+        with open(path, "rb", opener=_open_regular_file) as fh:
+            source = _read_json_source(fh, path, what)
+            captured = _INPUT_SOURCES.get()
+            if captured is not None:
+                info = os.fstat(fh.fileno())
+                captured.append((os.path.normcase(os.path.realpath(path)), info.st_dev, info.st_ino))
+    except FileNotFoundError as exc:
+        raise GateConfigError(f"{what} file not found: {path}") from exc
+    except (OSError, ValueError) as exc:
+        raise GateConfigError(f"{what} file could not be read: {path} ({exc})") from exc
+    try:
+        data = json.loads(
+            source.decode("utf-8"),
+            object_pairs_hook=lambda pairs: _duplicate_free_object(pairs, path, what),
+        )
+    except UnicodeDecodeError as exc:
+        raise GateConfigError(f"{what} file is not valid UTF-8: {path} ({exc})") from exc
     except json.JSONDecodeError as exc:
         raise GateConfigError(f"{what} file is not valid JSON: {path} ({exc})") from exc
+    except ValueError as exc:
+        raise GateConfigError(f"{what} file could not be parsed as JSON: {path} ({exc})") from exc
+    except RecursionError as exc:
+        raise GateConfigError(f"{what} file exceeds JSON nesting limit: {path} ({exc})") from exc
     return data, json_source_sha256(source)
 
 
@@ -36,11 +142,161 @@ def _require(data: dict, key: str, path: str, what: str) -> Any:
     return data[key]
 
 
+def _reject_unknown_keys(data: dict, allowed: tuple[str, ...], where: str) -> None:
+    unknown = sorted(k for k in data if k not in allowed)
+    if unknown:
+        raise GateConfigError(
+            f"{where}: unknown key(s): {', '.join(unknown)}; "
+            f"allowed keys: {', '.join(allowed)}"
+        )
+
+
+def _optional_object(data: dict, key: str, where: str) -> dict:
+    """An optional object field: absent or null loads as {}; any other
+    non-object value is a configuration error naming the location."""
+    value = data.get(key, {})
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise GateConfigError(f"{where} '{key}' must be an object")
+    return value
+
+
 def _is_number(value: Any) -> bool:
     """A real JSON number. bool is an int subclass in Python, so a bare
     isinstance(x, (int, float)) is True for True/False; a JSON boolean is never a
     numeric threshold or price and must be rejected, not silently used as 1/0."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: Any) -> bool:
+    """A JSON number that is also finite as a float (rejects NaN, +/-Infinity, and
+    integers too large to convert, which would overflow in the gate arithmetic)."""
+    if not _is_number(value):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _reject_nonfinite_freeform(value: Any, where: str, key_path: str = "") -> None:
+    """Deep fail-closed check for free-form dicts (scorer options, run params).
+
+    Walks nested dicts/lists and rejects any non-finite float via
+    _is_finite_number. ``where`` already names the file plus the scorer
+    index/type or role; the raised message appends the option key path.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{key_path}.{key}" if key_path else str(key)
+            _reject_nonfinite_freeform(item, where, child)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            child = f"{key_path}[{index}]" if key_path else f"[{index}]"
+            _reject_nonfinite_freeform(item, where, child)
+    elif isinstance(value, float) and not _is_finite_number(value):
+        raise GateConfigError(f"{where}: option '{key_path}' must be a finite number")
+
+
+def _normalize_version(value: Any, path: str, what: str) -> str:
+    """Keep the released numeric-version coercion while rejecting other JSON types."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)) or value == "":
+        raise GateConfigError(f"{what} {path}: 'version' must be a non-empty string or number")
+    if _is_number(value) and not _is_finite_number(value):
+        raise GateConfigError(f"{what} {path}: 'version' must be a finite number")
+    return str(value)
+
+
+def _validate_expected(expected: dict, path: str, i: int, item_id: str) -> None:
+    """Fail-closed shape check for a dataset item's ``expected`` block.
+
+    Only applied when a key is PRESENT; absent keys stay allowed and unknown
+    extra keys (e.g. ``_note``) stay allowed.
+    """
+    if "quality" in expected:
+        quality = expected["quality"]
+        if not isinstance(quality, dict):
+            raise GateConfigError(
+                f"dataset {path}: item #{i} '{item_id}' field 'expected.quality' must be an object"
+            )
+        for sub in ("must_contain", "must_not_contain"):
+            if sub in quality:
+                value = quality[sub]
+                if not isinstance(value, list) or any(
+                    not isinstance(elt, str) or not elt.strip() for elt in value
+                ):
+                    raise GateConfigError(
+                        f"dataset {path}: item #{i} '{item_id}' field "
+                        f"'expected.quality.{sub}' must be a list of non-empty strings"
+                    )
+        if not any(quality.get(sub) for sub in ("must_contain", "must_not_contain")):
+            raise GateConfigError(
+                f"dataset {path}: item #{i} '{item_id}' field 'expected.quality' "
+                "must contain at least one keyword assertion; omit 'quality' to opt out"
+            )
+    if "must_cite" in expected:
+        value = expected["must_cite"]
+        if not isinstance(value, list) or any(
+            not isinstance(elt, str) or not elt.strip() for elt in value
+        ):
+            raise GateConfigError(
+                f"dataset {path}: item #{i} '{item_id}' field 'expected.must_cite' "
+                f"must be a list of non-empty strings"
+            )
+    if "should_abstain" in expected:
+        if not isinstance(expected["should_abstain"], bool):
+            raise GateConfigError(
+                f"dataset {path}: item #{i} '{item_id}' field 'expected.should_abstain' "
+                f"must be a boolean"
+            )
+    if "fields" in expected:
+        if not isinstance(expected["fields"], dict):
+            raise GateConfigError(
+                f"dataset {path}: item #{i} '{item_id}' field 'expected.fields' must be an object"
+            )
+
+
+def _validate_grounded_documents(item_input: dict, where: str) -> None:
+    """Fail-closed shape check for ``input.documents`` on any task.
+
+    Absent stays allowed (adapters render it as ""); when present it must be
+    a list of ``{"id", "text"}`` objects with unique non-empty string ids and
+    string text, shared with the adapters so a bad dataset exits 2
+    instead of escaping as KeyError/TypeError mid-run.
+    """
+    if "documents" not in item_input:
+        return
+    docs = item_input["documents"]
+    if not isinstance(docs, list):
+        raise GateConfigError(
+            f"{where} field 'input.documents' "
+            f"must be a list of objects with string 'id' and 'text'"
+        )
+    seen: set[str] = set()
+    for pos, doc in enumerate(docs):
+        if not isinstance(doc, dict):
+            raise GateConfigError(
+                f"{where} field "
+                f"'input.documents[{pos}]' must be an object with string 'id' and 'text'"
+            )
+        doc_id = doc.get("id")
+        text = doc.get("text")
+        if not isinstance(doc_id, str) or not doc_id.strip():
+            raise GateConfigError(
+                f"{where} field "
+                f"'input.documents[{pos}].id' must be a non-empty string"
+            )
+        if doc_id in seen:
+            raise GateConfigError(
+                f"{where} field 'input.documents[{pos}].id': duplicate document id '{doc_id}'"
+            )
+        seen.add(doc_id)
+        if not isinstance(text, str):
+            raise GateConfigError(
+                f"{where} field "
+                f"'input.documents[{pos}].text' must be a string"
+            )
 
 
 # ---------------------------------------------------------------- dataset
@@ -71,6 +327,10 @@ def load_dataset(path: str) -> Dataset:
     name = _require(data, "name", path, "dataset")
     version = _require(data, "version", path, "dataset")
     task = _require(data, "task", path, "dataset")
+    for _key, _value in (("name", name), ("task", task)):
+        if not isinstance(_value, str) or not _value.strip():
+            raise GateConfigError(f"dataset {path}: '{_key}' must be a non-empty string")
+    version = _normalize_version(version, path, "dataset")
     raw_items = _require(data, "items", path, "dataset")
     if not isinstance(raw_items, list) or not raw_items:
         raise GateConfigError(f"dataset {path}: 'items' must be a non-empty list")
@@ -80,11 +340,22 @@ def load_dataset(path: str) -> Dataset:
         if not isinstance(entry, dict):
             raise GateConfigError(f"dataset {path}: item #{i} must be an object")
         item_id = entry.get("id")
-        if not item_id or not isinstance(item_id, str):
+        if not isinstance(item_id, str) or not item_id.strip():
             raise GateConfigError(f"dataset {path}: item #{i} needs a non-empty string 'id'")
         if item_id in seen:
             raise GateConfigError(f"dataset {path}: duplicate item id '{item_id}'")
         seen.add(item_id)
+        for _key in ("input", "expected"):
+            if _key in entry and not isinstance(entry[_key], dict):
+                raise GateConfigError(
+                    f"dataset {path}: item #{i} '{item_id}' field '{_key}' must be an object"
+                )
+        if isinstance(entry.get("expected", {}), dict):
+            _validate_expected(entry.get("expected", {}), path, i, item_id)
+        if isinstance(entry.get("input", {}), dict):
+            _validate_grounded_documents(
+                entry.get("input", {}), f"dataset {path}: item #{i} '{item_id}'",
+            )
         items.append(
             DatasetItem(
                 id=item_id,
@@ -93,7 +364,7 @@ def load_dataset(path: str) -> Dataset:
             )
         )
     return Dataset(
-        name=str(name), version=str(version), task=str(task),
+        name=name, version=version, task=task,
         items=items, path=path, sha256=digest, raw=data,
     )
 
@@ -118,23 +389,45 @@ def load_run_config(path: str, role: str) -> RunConfig:
     data, digest = _load_json_file(path, f"{role} config")
     if not isinstance(data, dict):
         raise GateConfigError(f"{role} config {path}: top level must be a JSON object")
-    name = data.get("name") or role
+    _reject_unknown_keys(
+        data,
+        ("name", "provider", "model", "params", "prompt", "provider_options"),
+        f"{role} config {path}",
+    )
+    if "name" not in data:
+        name = role
+    else:
+        name = data["name"]
+        if not isinstance(name, str) or not name:
+            raise GateConfigError(f"{role} config {path}: 'name' must be a non-empty string")
     provider = _require(data, "provider", path, f"{role} config")
+    if not isinstance(provider, str) or not provider:
+        raise GateConfigError(f"{role} config {path}: 'provider' must be a non-empty string")
     model = _require(data, "model", path, f"{role} config")
+    if not isinstance(model, str) or not model:
+        raise GateConfigError(f"{role} config {path}: 'model' must be a non-empty string")
     prompt = data.get("prompt", {})
     if not isinstance(prompt, dict):
         raise GateConfigError(f"{role} config {path}: 'prompt' must be an object")
     template = prompt.get("template")
-    if not template or not isinstance(template, str):
+    if not isinstance(template, str) or not template.strip():
         raise GateConfigError(
             f"{role} config {path}: prompt.template is required (a $field template; "
             f"see the task adapter for available fields)"
         )
+    if "system" in prompt and not isinstance(prompt["system"], str):
+        raise GateConfigError(
+            f"{role} config {path}: prompt.system must be a string"
+        )
+    params = _optional_object(data, "params", f"{role} config {path}")
+    _reject_nonfinite_freeform(params, f"{role} config {path}: 'params'")
+    provider_options = _optional_object(data, "provider_options", f"{role} config {path}")
+    _reject_nonfinite_freeform(provider_options, f"{role} config {path}: 'provider_options'")
     return RunConfig(
-        name=str(name), provider=str(provider), model=str(model),
-        params=data.get("params", {}) or {},
+        name=name, provider=provider, model=model,
+        params=params,
         prompt=prompt,
-        provider_options=data.get("provider_options", {}) or {},
+        provider_options=provider_options,
         path=path, sha256=digest, raw=data,
     )
 
@@ -154,14 +447,23 @@ def load_scorer_config(path: str) -> ScorerConfig:
     data, digest = _load_json_file(path, "scorer config")
     if not isinstance(data, dict):
         raise GateConfigError(f"scorer config {path}: top level must be a JSON object")
+    _reject_unknown_keys(data, ("scorers",), f"scorer config {path}")
     raw_scorers = _require(data, "scorers", path, "scorer config")
     if not isinstance(raw_scorers, list) or not raw_scorers:
         raise GateConfigError(f"scorer config {path}: 'scorers' must be a non-empty list")
     scorers = []
     for i, entry in enumerate(raw_scorers):
-        if not isinstance(entry, dict) or "type" not in entry:
-            raise GateConfigError(f"scorer config {path}: scorer #{i} needs a 'type'")
-        scorers.append({"type": entry["type"], "options": entry.get("options", {}) or {}})
+        if not isinstance(entry, dict):
+            raise GateConfigError(f"scorer config {path}: scorer #{i} 'type' must be a non-empty string")
+        _reject_unknown_keys(entry, ("type", "options"), f"scorer config {path}: scorer #{i}")
+        scorer_type = entry.get("type")
+        if not isinstance(scorer_type, str) or not scorer_type:
+            raise GateConfigError(f"scorer config {path}: scorer #{i} 'type' must be a non-empty string")
+        options = _optional_object(entry, "options", f"scorer config {path}: scorer #{i}")
+        _reject_nonfinite_freeform(
+            options, f"scorer config {path}: scorer #{i} ('{scorer_type}')"
+        )
+        scorers.append({"type": scorer_type, "options": options})
     return ScorerConfig(scorers=scorers, path=path, sha256=digest, raw=data)
 
 
@@ -203,6 +505,16 @@ def load_thresholds(path: str) -> Thresholds:
     for i, entry in enumerate(raw_rules):
         if not isinstance(entry, dict) or "metric" not in entry:
             raise GateConfigError(f"thresholds {path}: rule #{i} needs a 'metric'")
+        metric = entry["metric"]
+        if not isinstance(metric, str) or not metric:
+            raise GateConfigError(f"thresholds {path}: rule #{i} 'metric' must be a non-empty string")
+        allowed_keys = {"metric", "level", "on_unavailable"} | set(_CONSTRAINT_KEYS)
+        unknown_keys = sorted(k for k in entry if k not in allowed_keys)
+        if unknown_keys:
+            raise GateConfigError(
+                f"thresholds {path}: rule #{i} ({entry['metric']}) has unknown key(s): "
+                f"{', '.join(unknown_keys)}; allowed keys: {', '.join(sorted(allowed_keys))}"
+            )
         constraints = {k: entry[k] for k in _CONSTRAINT_KEYS if k in entry}
         if not constraints:
             raise GateConfigError(
@@ -214,6 +526,10 @@ def load_thresholds(path: str) -> Thresholds:
                 raise GateConfigError(
                     f"thresholds {path}: rule #{i} constraint '{key}' must be a number"
                 )
+            if not _is_finite_number(val):
+                raise GateConfigError(
+                    f"thresholds {path}: rule #{i} constraint '{key}' must be a finite number"
+                )
         level = entry.get("level", "fail")
         if level not in _LEVELS:
             raise GateConfigError(f"thresholds {path}: rule #{i} level must be one of {_LEVELS}")
@@ -224,7 +540,7 @@ def load_thresholds(path: str) -> Thresholds:
             )
         rules.append(
             ThresholdRule(
-                metric=str(entry["metric"]), constraints=constraints,
+                metric=metric, constraints=constraints,
                 level=level, on_unavailable=on_unavailable,
             )
         )
@@ -249,21 +565,39 @@ def load_pricing(path: str) -> PricingTable:
     if not isinstance(data, dict):
         raise GateConfigError(f"pricing table {path}: top level must be a JSON object")
     version = _require(data, "version", path, "pricing table")
+    version = _normalize_version(version, path, "pricing table")
+    if "currency" not in data:
+        currency = "USD"
+    elif not isinstance(data["currency"], str) or not data["currency"]:
+        raise GateConfigError(f"pricing table {path}: 'currency' must be a non-empty string")
+    else:
+        # ASCII only: str.upper() maps e.g. "ſ" (U+017F) to "S".
+        currency = data["currency"]
+        if currency.isascii():
+            currency = currency.upper()
+    if currency != "USD":
+        raise GateConfigError(
+            f"pricing table {path}: 'currency' must be exactly 'USD'; "
+            "cost.total_usd does not support currency conversion"
+        )
     models = _require(data, "models", path, "pricing table")
     if not isinstance(models, dict):
         raise GateConfigError(f"pricing table {path}: 'models' must be an object")
     for model, entry in models.items():
-        if (
-            not isinstance(entry, dict)
-            or not _is_number(entry.get("input_per_mtok"))
-            or not _is_number(entry.get("output_per_mtok"))
-        ):
+        if not isinstance(entry, dict):
             raise GateConfigError(
                 f"pricing table {path}: model '{model}' needs numeric "
                 f"input_per_mtok and output_per_mtok"
             )
+        for key in ("input_per_mtok", "output_per_mtok"):
+            rate = entry.get(key)
+            if not _is_finite_number(rate) or rate < 0:
+                raise GateConfigError(
+                    f"pricing table {path}: model '{model}' field '{key}' must be "
+                    f"a finite, non-negative number"
+                )
     return PricingTable(
-        version=str(version), currency=str(data.get("currency", "USD")),
+        version=version, currency=currency,
         models=models, path=path, sha256=digest, raw=data,
     )
 

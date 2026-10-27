@@ -1,0 +1,129 @@
+# Changelog
+
+## Unreleased
+
+- Fixed: extraction adapter v4 rejects duplicate JSON object keys at every depth
+  as output parse errors, preventing field-match and schema checks from passing
+  after earlier values were silently discarded. Valid extraction report hashes
+  also change because run summaries record the adapter version.
+
+- Fixed: reject empty or whitespace-only `expected.must_cite` ids at dataset load
+  with a contextual configuration error (exit 2); such an id could never be cited.
+  This tightens loading: a dataset that relied on a blank id now fails at load. (#162)
+
+- Fixed: distinguish the threshold verdict from GitHub command-file delivery
+  failures in stdout and writable step summaries, retaining exit 2 and the
+  published report verdict when delivery fails. (#163)
+
+- Fixed: compare integer-only floors, ceilings, absolute changes and percentage
+  changes exactly, preventing float rounding from accepting violated thresholds
+  at large integer boundaries. Previously passing edge cases now fail closed.
+- Fixed: apply zero tolerance to zero-baseline percentage guards: any positive
+  candidate breaches a finite `max_increase_pct`, and any negative candidate
+  breaches `max_drop_pct`. Signed zero still passes; tiny nonzero regressions
+  previously hidden by the absolute float tolerance now fail closed.
+
+- Fixed: accept pricing currency codes case-insensitively and normalize USD
+  to uppercase; non-USD currencies remain configuration errors (exit 2). (#154)
+
+- Fixed: validate present `input.documents` for every dataset task at load time;
+  malformed documents raise a contextual configuration error (exit 2) before
+  reports are written. Omitted documents remain accepted. This tightens loading:
+  a non-grounded dataset carrying an unrelated `documents` shape now fails at load.
+
+- Citation validity excludes abstentions, so a candidate abstaining where the
+  baseline had an applicable answer makes citation `max_drop_abs`/`max_drop_pct`
+  checks incomparable and unavailable (fail by default), even if answer quality
+  is otherwise acceptable. RAG suites may use `on_unavailable: "warn"` for citation
+  rules, trading fail-closed enforcement of unavailable comparisons for warnings.
+  (#154)
+
+- **BREAKING:** A baseline-side provider error that changes the compared item
+  cohorts now makes affected relative checks unavailable and fails the gate
+  (exit 1) under the default `on_unavailable: "fail"`, instead of allowing a
+  healthy candidate to pass (exit 0) with only a baseline-error notice. The
+  notice remains; candidate-only constraints retain their scope. (#154)
+
+- Refuse relative metric comparisons over different successful/applicable item
+  cohorts or incomplete latency coverage: checks become unavailable (fail by
+  default), naming missing item IDs and both denominators. Suppress misleading
+  deltas; candidate-only floors/ceilings retain their scope. Stored-bundle
+  comparative audits enforce the same guard. (#108)
+
+- Validate each scorer's declared per-item results before merging/aggregation;
+  omitted, undeclared or malformed scores and system-metric ownership refuse
+  the run with a configuration error (exit 2). (#105)
+
+- Reject non-USD pricing tables (exit 2) before evaluating USD cost policy;
+  an omitted currency still defaults to USD. (#106)
+
+- Reject present `expected.quality` blocks without keyword assertions (exit 2);
+  omit `quality` to opt out. Empty or blank keywords remain invalid. (#113)
+
+- Reject an explicit JSON Schema `"type": null` as a configuration error (exit 2),
+  including nested schemas. Omitted `type` stays unconstrained; `"type": "null"`
+  still accepts only JSON null.
+
+- Require unique document IDs within each `rag` or `assistant` dataset item
+  (at load, now for any task whose item carries `input.documents`; see the entry
+  above). Duplicate IDs raise a contextual configuration error (exit 2), also on
+  direct `rag`/`assistant` adapter calls, instead of allowing ambiguous citations to pass.
+
+- Unknown keys in run configs and scorer configs (top level and scorer entries) are now
+  configuration errors (exit 2) naming the allowed keys, instead of being ignored.
+
+- Add read-only consumer-policy audits of verified stored aggregates, with optional
+  evidence/policy pins and separate original/new verdicts. Reject malformed direct
+  evaluator inputs before computing policy outcomes.
+
+- Field-match scorer v3 checks field presence separately from literal values; an
+  absent field can no longer equal the legitimate string `<missing>`.
+
+- Retain known response measurements after local processing failures, make partial
+  token/cost totals unavailable, and attribute failures to their processing stage.
+
+- Keep multiline workflow outputs literal, refuse command-file aliases to inputs
+  or evidence, and enforce statuses as data rather than shell source.
+
+- Add offline bundle integrity receipts, trusted-pin verification and an Action
+  bundle-hash output, without reclassifying integrity as a passing gate.
+
+- Protect loaded inputs and existing report bundles with staged publication,
+  output-alias checks, cooperative locking and recoverable rollback.
+
+- Add no-execution `plan` output and opt-in `sha256-v1` replay binding to the
+  fully rendered request; binding errors cannot be relaxed by error-rate rules.
+- Add CLI/Action binding requirements, report assurance disclosures, and a
+  synthetic end-to-end replay/stale-evidence demo in the cross-Python CI matrix.
+
+- Add opt-in per-file `--max-input-bytes` limits to gate/run and the Action,
+  including transitive fixtures and an explicit manifest receipt.
+- Add `run --fail-on-errors`, preserving diagnostic output and the default exit
+  contract while allowing automation to reject any failed item with exit 2.
+
+## 0.2.0 — 2026-10-02
+
+This GPL release aligns the current source, package identity and Action release.
+It retains the strict input contract; it does not restore legacy numeric name or
+model coercion. Dataset/config names and model IDs must be non-empty strings.
+Use `"123"` instead of `123` for a numeric-looking identifier. Invalid measured
+usage, latency, pricing or threshold policy still fails closed.
+
+- Contextual configuration diagnostics cover unreadable/non-regular files,
+  malformed JSON/UTF-8, parser limits, fixture paths and oversized latency values.
+- JSON-null schema scoring, report escaping and validation improvements since
+  v0.1.2 are included; scorer/adapter identities describe those changes.
+- Wheels and source archives include the GPL licence, relicensing record and
+  retained MIT attribution, with fresh offline installation smoke in CI.
+- Exit semantics remain 0 pass / 1 regression blocked / 2 could-not-run; the
+  offline provider, threshold behavior and zero runtime dependencies remain.
+
+### Licence and floating `v0`
+
+v0.2.0 is GPL-3.0-only. Immutable v0.1.2 and earlier MIT releases retain their
+previously granted rights and are never rewritten. The repository owner
+explicitly approved publishing the strict GPL release and moving `v0` to it on
+2026-10-02. This is a specific approved transition: floating `v0` consumers will
+receive GPL source and the strict identifiers. Pin an immutable historical MIT
+tag if that is the required licence, or pin an immutable current version/SHA.
+The release ledger records publication and tag verification separately.

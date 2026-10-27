@@ -20,17 +20,20 @@ Fixture file shape:
       }
     }
 
-A missing (model, item_id) entry raises ProviderError — the same path a real
-provider outage takes — so provider-failure behavior is testable offline.
+Legacy mode looks up (model, item_id) only; it does not bind the rendered request.
+With provider_options.request_binding="sha256-v1", each retrieved entry also
+requires a matching request_sha256. Missing or stale bound evidence raises
+GateConfigError before any thresholdable provider failure. See docs/request-binding.md.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import re
 
 from ..errors import GateConfigError, ProviderError
-from ..hashing import json_source_sha256
+from ..loading import _is_finite_number, _load_json_file
+from ..requests import BINDING_SCHEME, request_fingerprint
 from . import Provider, ProviderRequest, ProviderResult, register_provider
 
 
@@ -47,6 +50,11 @@ def _validate_fixtures(responses: dict, path: str) -> None:
             where = f"fixtures {path}, model '{model}', item '{item_id}'"
             if not isinstance(entry, dict):
                 raise GateConfigError(f"fake provider {where}: entry must be an object")
+            if "text" not in entry and "error" not in entry:
+                raise GateConfigError(f"fake provider {where}: entry must have 'text' or 'error'")
+            for field in ("text", "error"):
+                if field in entry and not isinstance(entry[field], str):
+                    raise GateConfigError(f"fake provider {where}: {field} must be a string")
             for field in ("prompt_tokens", "completion_tokens"):
                 value = entry.get(field)
                 if value is not None and (
@@ -58,10 +66,10 @@ def _validate_fixtures(responses: dict, path: str) -> None:
                     )
             latency = entry.get("latency_ms")
             if latency is not None and (
-                not isinstance(latency, (int, float)) or isinstance(latency, bool) or latency < 0
+                not _is_finite_number(latency) or latency < 0
             ):
                 raise GateConfigError(
-                    f"fake provider {where}: latency_ms must be a non-negative number "
+                    f"fake provider {where}: latency_ms must be a finite non-negative number "
                     f"or omitted, got {latency!r}"
                 )
 
@@ -70,48 +78,64 @@ class FakeProvider(Provider):
     name = "fake"
 
     def __init__(self, options: dict, base_dir: str):
+        if "request_binding" in options and options["request_binding"] != BINDING_SCHEME:
+            raise GateConfigError(f"fake provider request_binding must be {BINDING_SCHEME!r} when supplied")
+        self.request_binding = options.get("request_binding")
         fixtures = options.get("fixtures")
-        if not fixtures:
+        if not isinstance(fixtures, str) or not fixtures:
             raise GateConfigError(
-                "fake provider requires provider_options.fixtures (path to fixture JSON)"
+                "fake provider requires provider_options.fixtures (non-empty string path to fixture JSON)"
             )
         path = fixtures if os.path.isabs(fixtures) else os.path.join(base_dir, fixtures)
-        if not os.path.isfile(path):
-            raise GateConfigError(f"fake provider fixture file not found: {path}")
-        try:
-            with open(path, "rb") as fh:
-                source = fh.read()
-            data = json.loads(source.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise GateConfigError(f"fake provider fixtures not valid JSON: {path} ({exc})") from exc
+        data, digest = _load_json_file(path, "fake provider fixture")
         if not isinstance(data, dict) or not isinstance(data.get("responses"), dict):
             raise GateConfigError(f"fake provider fixtures {path}: expected {{'responses': {{...}}}}")
+        if self.request_binding and data.get("version") != "1":
+            raise GateConfigError("fake provider request binding requires fixture version '1'")
         _validate_fixtures(data["responses"], path)
-        self.fixtures_path = path
+
         # The config-relative reference (what the run config actually wrote). Unlike
         # the resolved absolute path, it is stable across checkout locations, so it is
         # safe to surface in per-item error messages that land in report.json.
         self.fixtures_ref = fixtures
-        self.fixtures_sha256 = json_source_sha256(source)
+        self.fixtures_sha256 = digest
         self.responses: dict = data["responses"]
 
     def complete(self, request: ProviderRequest) -> ProviderResult:
         by_model = self.responses.get(request.model)
         if by_model is None:
+            if self.request_binding:
+                raise GateConfigError(f"fake provider request binding: no fixtures for model '{request.model}'")
             raise ProviderError(
                 f"no fixtures for model '{request.model}' in {self.fixtures_ref}"
             )
         entry = by_model.get(request.item_id)
         if entry is None:
+            if self.request_binding:
+                raise GateConfigError(f"fake provider request binding: missing item '{request.item_id}' "
+                                      f"under model '{request.model}'")
             raise ProviderError(
                 f"no fixture for item '{request.item_id}' under model "
                 f"'{request.model}' in {self.fixtures_ref}"
             )
+        if self.request_binding:
+            digest = entry.get("request_sha256")
+            if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+                raise GateConfigError(f"fake provider request binding: item '{request.item_id}' "
+                                      "requires a lowercase sha256 request_sha256")
+            if digest != request_fingerprint(request):
+                raise GateConfigError(f"fake provider request binding mismatch for item '{request.item_id}' "
+                                      f"under model '{request.model}'; recapture evidence for the rendered request")
         if "error" in entry:
             raise ProviderError(f"simulated provider failure: {entry['error']}")
         if "text" not in entry:
             raise ProviderError(
                 f"fixture for item '{request.item_id}' has neither 'text' nor 'error'"
+            )
+        if not isinstance(entry["text"], str):
+            raise ProviderError(
+                f"fixture for item '{request.item_id}' under model "
+                f"'{request.model}' in {self.fixtures_ref} has non-string text"
             )
         return ProviderResult(
             text=entry["text"],
@@ -129,10 +153,13 @@ class FakeProvider(Provider):
         # the repo is checked out (reproducibility contract). The absolute path is
         # volatile and is not part of what produced the verdict; fixtures_sha256 is
         # the reproducible identity, and the manifest already records the config paths.
-        return {
+        identity = {
             "name": self.name,
             "fixtures_sha256": self.fixtures_sha256,
         }
+        if self.request_binding:
+            identity["request_binding"] = self.request_binding
+        return identity
 
 
 register_provider("fake", FakeProvider)

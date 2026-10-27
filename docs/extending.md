@@ -46,8 +46,10 @@ Then import it from `providers/__init__.py` alongside the fake provider.
   otherwise pass `None`. Downstream shows *unavailable*; it must never guess.
 - On failure, raise `ProviderError` with a useful message. Never return placeholder text:
   a fabricated answer would be scored as if the model produced it.
-- Make `describe()` return whatever pins the run's identity (endpoint, api version) —
-  it lands in the manifest.
+- Make `describe()` return whatever pins the run's identity (endpoint, api version) -
+  it appears in the run summary (`run.json` and `report.json`'s `runs`); the
+  manifest separately records provider identities. Keep filesystem paths and
+  volatile values out of this block because it contributes to the result hash.
 - Determinism: prefer temperature 0 / seeds where the API offers them, and say in
   `describe()` when results are inherently non-reproducible.
 
@@ -55,10 +57,19 @@ Then import it from `providers/__init__.py` alongside the fake provider.
 
 Subclass `TaskAdapter`; provide `prompt_fields(item)` (the `$fields` your users'
 templates can reference) and `parse(text, item) -> ParsedOutput`. Set `name` and bump
-`version` whenever parsing conventions change — the version is recorded in run manifests,
-so a convention change is visible as a different run identity. Register in
+`version` whenever parsing conventions change - the version is recorded in run summaries
+(`run.json` and `report.json`'s `runs`),
+so a convention change is visible as a different run identity. `manifest.json` pins only provider identity and config hashes; adapter name/version are not recorded there. Register in
 `adapters/__init__.py`. Keep output conventions (citation markers, abstention phrasing)
-in the adapter — scorers must stay convention-agnostic.
+in the adapter — scorers must stay convention-agnostic. Set `required_input`
+to the input keys your prompt needs as non-empty strings (missing one is exit 2).
+
+Structured adapters set `ParsedOutput.has_json=True` when JSON parsing succeeds,
+including when the parsed value is JSON `null` (`json_obj=None`). Leave it false
+for unstructured output or failed parsing. Existing non-null `json_obj` values
+remain valid without the flag. Extraction adapter v2 and JSON-schema scorer v3
+distinguish parsed null from absent JSON; a null schema accepts only parsed null,
+while unstructured RAG/assistant output and parse errors still fail.
 
 ## Adding a scorer
 
@@ -89,10 +100,15 @@ register_scorer("politeness", PolitenessScorer)
 Rules:
 
 - **One owner per metric.** `build_scorers` rejects two scorers emitting the same key.
+  System metrics (`errors.error_rate`, latency, token and cost metrics) cannot be
+  owned by a scorer. Each call must return exactly its declared metric keys.
 - **Declare `kind: "heuristic_rate"`** for rule-based proxies so reports label them
   honestly. Use `mode: "violation_rate"` for lower-is-better rates (see `abstention.py`).
 - **`applicable=False` over fake passes.** An item your scorer can't judge must not
   inflate the denominator.
+  Each result requires boolean `applicable`, boolean `passed` when applicable
+  (otherwise `None`), and optional `detail` as a string or `None`. Missing,
+  undeclared or malformed results are configuration errors (exit 2).
 - Options arrive via scorer config (`{"type": "politeness", "options": {...}}`); validate
   them in `__init__` and raise `GateConfigError` on nonsense — exit 2 beats a wrong verdict.
 - Thresholds referencing your metric work immediately; nothing in `gate.py` changes.

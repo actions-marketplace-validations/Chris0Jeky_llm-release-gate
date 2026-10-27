@@ -27,6 +27,14 @@ inputs:
     description: "Path to the pricing-table JSON (omit: cost reported unavailable)"
     required: false
     default: ""
+  max-input-bytes:
+    description: "Maximum raw bytes per JSON input including fixtures (empty: unlimited)"
+    required: false
+    default: ""
+  require-request-binding:
+    description: "Require sha256-v1 request-bound replay in both run configs ('true'/'false')"
+    required: false
+    default: "false"
   out:
     description: "Output directory for reports and the run manifest"
     required: false
@@ -51,6 +59,9 @@ outputs:
   result-hash:
     description: "Content hash identifying this comparison result"
     value: ${{ steps.gate.outputs.result-hash }}
+  bundle-hash:
+    description: "Integrity hash for this report bundle and invocation manifest"
+    value: ${{ steps.gate.outputs.bundle-hash }}
   report-json:
     description: "Path to report.json"
     value: ${{ steps.gate.outputs.report-json }}
@@ -88,6 +99,8 @@ runs:
         IN_THRESHOLDS: ${{ inputs.thresholds }}
         IN_PRICING: ${{ inputs.pricing }}
         IN_OUT: ${{ inputs.out }}
+        IN_MAX_INPUT_BYTES: ${{ inputs.max-input-bytes }}
+        IN_REQUIRE_BINDING: ${{ inputs.require-request-binding }}
       run: |
         set +e
         args=(
@@ -101,53 +114,51 @@ runs:
         if [ -n "$IN_PRICING" ]; then
           args+=(--pricing "$IN_PRICING")
         fi
+        if [ -n "$IN_MAX_INPUT_BYTES" ]; then
+          args+=(--max-input-bytes "$IN_MAX_INPUT_BYTES")
+        fi
+        case "$IN_REQUIRE_BINDING" in
+          true) args+=(--require-request-binding) ;;
+          false) ;;
+          *) echo "::error::require-request-binding must be true or false"
+             echo "cli-exit=2" >> "$GITHUB_OUTPUT"; exit 0 ;;
+        esac
         python -m llm_release_gate gate "${args[@]}"
         code=$?
         echo "cli-exit=$code" >> "$GITHUB_OUTPUT"
         exit 0
 
-    # Finds this action's own previous comment via a marker (never touches other
-    # bots' comments) and updates it, else creates one. Comment delivery failure
-    # (e.g. missing `pull-requests: write`) is a warning, not a failed check —
+    # Bind reports to their writer, head and invocation; retire older verdicts.
+    # Comment delivery failure (e.g. missing `pull-requests: write`) is a warning —
     # the verdict must come from the gate, and the enforce step must still run.
     - name: Comment on pull request
       if: >-
         inputs.comment == 'true' &&
-        (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') &&
-        steps.gate.outputs.report-md != ''
+        (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         REPORT_MD: ${{ steps.gate.outputs.report-md }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
-        REPO: ${{ github.repository }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        GATE_EXIT_CODE: ${{ steps.gate.outputs.cli-exit }}
+        DEFAULT_TOKEN: ${{ inputs.github-token == github.token }}
+        REPORT_SCOPE: ${{ github.workflow_ref }}:${{ github.job }}:${{ github.action }}
+        REPORT_MATRIX: ${{ toJSON(matrix) }}
       run: |
-        set +e
-        marker="<!-- llm-release-gate-report -->"
-        body_file="$(mktemp)"
-        printf '%s\n\n' "$marker" | cat - "$REPORT_MD" > "$body_file"
-        comment_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-          --jq "[.[] | select(.body | startswith(\"$marker\"))][0].id" 2>/dev/null)
-        if [ -n "$comment_id" ] && [ "$comment_id" != "null" ]; then
-          gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -F body=@"$body_file" >/dev/null
-        else
-          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@"$body_file" >/dev/null
-        fi
-        if [ $? -ne 0 ]; then
+        if ! python "$GITHUB_ACTION_PATH/scripts/post_pr_comment.py"; then
           echo "::warning::llm-release-gate could not post the PR comment (does the workflow grant 'pull-requests: write'?). The verdict is unaffected; see the job summary."
         fi
-        exit 0
 
     - name: Enforce gate verdict
       shell: bash
+      env:
+        GATE_EXIT_CODE: ${{ steps.gate.outputs.cli-exit }}
       run: |
-        code="${{ steps.gate.outputs.cli-exit }}"
-        if [ "$code" = "0" ]; then
-          echo "gate passed"
-        elif [ "$code" = "1" ]; then
-          echo "::error::llm-release-gate blocked this change (material regression). See the PR comment / job summary."
-          exit 1
-        else
-          echo "::error::llm-release-gate could not evaluate (exit $code) — fix the gate configuration."
-          exit "${code:-2}"
-        fi
+        case "$GATE_EXIT_CODE" in
+          0) echo "gate passed" ;;
+          1) echo "::error::llm-release-gate blocked this change (material regression). See the PR comment / job summary."
+             exit 1 ;;
+          *) echo "::error::llm-release-gate could not evaluate; fix the gate configuration."
+             exit 2 ;;
+        esac

@@ -25,6 +25,26 @@ class ParsedOutput:
     abstained: bool = False
     json_obj: Optional[object] = None    # parsed JSON body (extraction tasks)
     parse_error: Optional[str] = None    # set when structured parsing failed
+    has_json: bool = False  # True only when json.loads succeeded (incl. JSON null)
+
+
+def require_prompt_str(item: DatasetItem, task: str, key: str) -> str:
+    """Raw prompt input as a string, fail-closed on wrong types.
+
+    Absent keys render as "" (requiredness stays enforced by
+    TaskAdapter.required_input in build_request). A present non-string value
+    is configuration — raise GateConfigError naming item id and field instead
+    of str()-coercing 12345/None into a queried prompt.
+    """
+    if key not in item.input:
+        return ""
+    value = item.input[key]
+    if not isinstance(value, str):
+        raise GateConfigError(
+            f"dataset item '{item.id}': task '{task}' requires "
+            f"input.{key} as a string"
+        )
+    return value
 
 
 class TaskAdapter(ABC):
@@ -33,6 +53,7 @@ class TaskAdapter(ABC):
 
     name: str = "abstract"
     version: str = "0"
+    required_input: tuple[str, ...] = ()
 
     @abstractmethod
     def prompt_fields(self, item: DatasetItem) -> dict[str, str]:
@@ -43,6 +64,13 @@ class TaskAdapter(ABC):
         """Interpret raw model text under this task's output conventions."""
 
     def build_request(self, item: DatasetItem, config: RunConfig) -> ProviderRequest:
+        for key in self.required_input:
+            value = item.input.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise GateConfigError(
+                    f"dataset item '{item.id}': task '{self.name}' requires "
+                    f"input.{key} as a non-empty string"
+                )
         fields = self.prompt_fields(item)
         template = Template(config.prompt.get("template", ""))
         # A typo'd placeholder would silently render literally and every request

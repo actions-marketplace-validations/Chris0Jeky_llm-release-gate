@@ -2,7 +2,7 @@
 
 **T2 daily driver** · push free / merge free · single-runtime (Claude) · tier + flags:
 `.agent-harness/tier.json` · human decisions: `HUMAN_TODO.md`. Global laws are injected
-from `~/.claude/CLAUDE.md`; this file carries only what is true of *this* repo.
+from `~/.claude/rules/laws.md`; this file carries only what is true of *this* repo.
 
 ## What this is
 
@@ -11,31 +11,34 @@ inputs (dataset, baseline config, candidate config, scorers, thresholds — plus
 pricing table) it runs baseline and candidate over the golden dataset, scores both, writes
 `report.{json,md,html}` + `manifest.json`, and exits **0 pass / 1 regression blocked /
 2 could-not-run**. Zero runtime dependencies; offline by default — the `fake` provider
-replays committed fixtures, so tests, demos and CI need no API key. Package version is v0.1.2;
+replays committed fixtures, so tests, demos and CI need no API key. Package version is v0.2.0;
 the current public-release stage lives in `ORCHESTRATOR.md`.
 
-## Run it (measured 2026-08-02, Windows, Python 3.14.3)
+## Run it (measured 2026-10-02, Windows, Python 3.14.3, pytest 9.0.3)
+
+Measurement base: main `898b9ecafe67639b55de668b3624f6720a00755a`. Counts and
+timings describe that snapshot; see `docs/testing.md` for the pinned setup.
 
 | Goal | Command | Result here |
 |---|---|---|
 | dev install | `make install` (`pip install -e ".[dev]"`) | — |
-| full suite | `python -m pytest` | `84 passed in 0.53s` |
+| full suite | `python -m pytest` | `324 passed in 1.16s` |
 | green demos | `make demo-green` | both gates PASS, exit 0 |
 | red demo | `make demo-red` | gate FAIL, exit 1 (that is success) |
-| what CI runs | `make ci` | test + demo-green + demo-red |
+| what CI runs | `make ci PY=python` | tests + both green demos + red demo; 2.36s total |
 
-`make` resolves under Git Bash on this box; without it, copy the exact
-`python -m llm_release_gate gate --dataset … --out …` argument list out of the Makefile.
+On Windows, use Git-for-Windows Bash as Make's shell; `docs/testing.md` records
+the exact shell override and temporary-directory setup. Without Make, copy the
+exact CLI arguments out of the Makefile.
 
-**Worktree trap (measured).** The editable install resolves to the MAIN checkout, so a bare
-`python -m pytest` inside a linked worktree silently tests the *other* tree's source. In a
-worktree, prefix everything: `PYTHONPATH=src python -m pytest`, `PYTHONPATH=src python -m
-llm_release_gate …`.
+**Worktree trap.** An editable install may resolve to a different checkout.
+Pytest's repository config already pins `src`; pin source explicitly for all
+worktree commands: `PYTHONPATH=src python -m pytest` and `PYTHONPATH=src python -m
+llm_release_gate ...`.
 
 ## Cold start and progression
 
-Read `~/.claude/ESTATE.md` before working an unfamiliar checkout, then read `AGENTS.md`, this
-file, `.agent-harness/tier.json`, `ORCHESTRATOR.md`, `HUMAN_TODO.md`, and `NEXT.md`. Refresh
+Read `~/.claude/ESTATE.md` before working an unfamiliar checkout, then this file, `.agent-harness/tier.json`, `ORCHESTRATOR.md`, `HUMAN_TODO.md`, and `NEXT.md`. Refresh
 `git status --short --branch`, worktree occupancy, `origin/main`, open PRs/issues/checks/review
 threads, and GitHub release/tag state. The ledger supplies the release/maintenance ladder and
 exact resume point; live evidence outranks it.
@@ -48,17 +51,17 @@ publishing, harness, scheduler, or platform work merely to fill the queue.
 
 ## Proving checks by seam
 
-Run the narrowest row that covers your diff; each is well under a second.
+Run the narrowest row that covers your diff; counts and timings vary as tests grow.
 
 | You changed | Run (`pytest` = `python -m pytest`) |
 |---|---|
-| `scorers/`, `adapters/` | `pytest tests/test_scorers.py` (20) |
-| `gate.py`, threshold rules | `pytest tests/test_verdicts.py` (15) |
-| `reports/`, `metrics.py` | `pytest tests/test_reports.py` (5) |
-| `pricing.py` | `pytest tests/test_cost.py` (8) |
-| `cli.py`, exit codes, GH env vars | `pytest tests/test_cli.py` (13) |
-| `providers/`, `runner.py` | `pytest tests/test_provider_failure.py` (9) |
-| anything in the report dict | `pytest tests/test_hashing.py tests/test_reproducibility.py` (14) |
+| `scorers/`, `adapters/` | `pytest tests/test_scorers.py` |
+| `gate.py`, threshold rules | `pytest tests/test_verdicts.py` |
+| `reports/`, `metrics.py` | `pytest tests/test_reports.py` |
+| `pricing.py` | `pytest tests/test_cost.py` |
+| `cli.py`, exit codes, GH env vars | `pytest tests/test_cli.py` |
+| `providers/`, `runner.py` | `pytest tests/test_provider_failure.py` |
+| anything in the report dict | `pytest tests/test_hashing.py tests/test_reproducibility.py` |
 | `examples/`, fixtures, thresholds | `make demo-green && make demo-red` |
 | `action.yml` | not runnable locally — the CI `action-self-test` lane is the only proof |
 
@@ -90,6 +93,11 @@ only — deterministic replay keyed by model + item_id), `adapters/` (`rag`, `as
    rather than passing them.
 7. **Zero runtime dependencies.** A new runtime dep needs a NEXT.md-level justification.
 
+For v0.2.0 only, the owner explicitly selected strict identifiers and approved
+publishing GPL source and moving `v0` to it on 2026-10-02. This specific transition
+is an exception to the default breaking-change/major-version rule above; see
+ADR 0006 and `HUMAN_TODO.md`. It does not authorize future unattended tag moves.
+
 New behavior lands with the test that pins it; schema/metric/command changes update the docs
 in the same commit, and README output blocks must match what the code actually prints.
 
@@ -103,8 +111,9 @@ in the same commit, and README output blocks must match what the code actually p
 - Docs quote measured numbers (test count, demo result hashes, cost deltas). Change behavior
   → re-run and re-quote. A stale hash in `docs/testing.md` is a false measurement, not a typo.
 - `out/` is gitignored build output, not source.
-- The deny floor is deliberately **not** vendored here — it arrives from the global
-  PreToolUse hook; a repo copy would double-spawn against it.
+- No deny floor is vendored here, and none runs for Claude on DESKTOP-IHKOOJS (owner decisions of
+  2026-09-07/09-20; Kraspyon keeps a user-scope hook, which a repo copy would double-spawn
+  against). Act as if nothing catches an irreversible command.
 - **No secrets, ever.** No real provider exists yet; when one lands it reads keys from the
   environment only (`os.environ[...]`, `docs/extending.md`) — never a config file, never
   committed. That first adapter also triggers a `sensitive_data` flag review (`NEXT.md`).

@@ -4,14 +4,19 @@
 
 ```bash
 make install      # pip install -e ".[dev]"
-make test         # pytest (84 tests)
+make test         # pytest (see the pinned measurement below)
 make demo-green   # both green examples; target fails unless both exit 0
 make demo-red     # red example; target fails unless the gate exits exactly 1
-make ci           # test + demo-green + demo-red (what CI runs)
+make demo-bound   # synthetic bound replay + stale-evidence refusal
+make ci           # test + demo-green + demo-red + demo-bound (what CI runs)
 ```
 
 Windows note: run under Git Bash (GNU make + sh), or call the underlying
 `python -m pytest` / `python -m llm_release_gate ...` commands directly.
+Action-script tests select Git Bash beside the Git executable on Windows, then
+try `C:/Program Files/Git/bin/bash.exe`; they skip if neither is available.
+They do not use the WindowsApps/WSL Bash alias or require a shell-selection PATH
+override. On POSIX they use Bash from PATH.
 
 ## What the suite covers (and deliberately not)
 
@@ -28,6 +33,9 @@ math, provider failure, report honesty, exit codes — not line-coverage maximiz
 | `test_scorers.py` | adapter parsing (citations, abstention regex, JSON fence stripping); all four abstention quadrants; hedged-fabrication answers (hedge + citation) counted as answers with citations validated; citation validity incl. fabricated citations on should-abstain items; keyword/field-match pass/fail/applicability; JSON-schema subset violations; unenforceable schemas rejected at construction; JSON-strict bool≠int semantics at every depth (incl. nested lists/dicts) |
 | `test_reports.py` | rates rendered with sample counts; heuristic footnote present; unavailable cost labeled with its reason (and no fabricated `$0`); partial-coverage latency note surfaced in the markdown PR comment, not only the HTML; HTML escapes model output; failing items carry actionable detail |
 | `test_cli.py` | exit 0 (both green examples), exit 1 (red example, naming the regressions), exit 2 (missing file, bad rule, metric without scorer, missing/typo'd prompt template, malformed dataset, internal error); breached warn-level rule annotates but exits 0; `GITHUB_STEP_SUMMARY` / `GITHUB_OUTPUT` writing; `hash` and `run` subcommands |
+| `test_expected_shapes.py` | dataset `expected`-block shapes validated fail-closed at load (wrong `quality` / `must_cite` / `should_abstain` / `fields` shape → config error, exit 2); well-shaped and empty blocks accepted; bad shape exits 2 end-to-end |
+| `test_nonfinite_latency.py` | non-finite latency fails closed: NaN/±Infinity rejected as fixture config errors, `scalar_metric` reports them unavailable (never an available NaN), a NaN-latency candidate exits 2, and NaN aggregates stay unavailable so thresholds cannot pass on them |
+| `test_required_input.py` | items missing the task's prompt input (`input.question` for grounded tasks, `input.text` for extraction — absent, blank, or wrong-key) fail closed with exit 2 / `GateConfigError`; valid items build byte-identical prompts |
 
 The reproducibility tests also prove that changing only physical JSON source line endings
 (LF, CRLF, or lone CR) leaves the report, result hash, and fake-fixture identities unchanged.
@@ -39,12 +47,20 @@ tests break exactly one thing per case.
 see NEXT.md); the Action's PR-comment step (needs a live PR; the rest of action.yml is
 self-tested in CI on both examples and the step logic was exercised locally, below).
 
-## Verified runs (2026-08-02, Windows 10, Python 3.14.3; CI mirrors on ubuntu 3.11/3.13)
+## Verified runs (2026-10-02, Windows, Python 3.14.3, pytest 9.0.3)
+
+Measured main commit `898b9ecafe67639b55de668b3624f6720a00755a` before the
+diagnostic-fix PRs. Test counts and timings describe this snapshot; they are
+not a fixed suite contract. The CI workflow declares Ubuntu Python 3.11/3.13
+and the Action self-test; those hosted lanes are separate evidence.
+
+`PYTHONPATH=src make ci PY=python` with Git-for-Windows Bash as Make's shell
+completed in 2.36 seconds. Its pytest step produced:
 
 `python -m pytest` →
 
 ```
-84 passed in 0.53s
+324 passed in 1.16s
 ```
 
 `make demo-green` → both gates PASS, exit 0. RAG example (prompt improvement):
@@ -59,20 +75,67 @@ llm-release-gate: gate FAIL
   [FAIL] quality.pass_rate: drop 0.375 vs allowed 0.1
   [FAIL] abstention.false_answer_rate: candidate 1 vs allowed maximum 0
   [FAIL] citations.valid_rate: drop 0.3 vs allowed 0.05
-  result hash: sha256:df684a0135c1cce66ca8977cd5c8234d710324010125e27c828d2fcecbb282f8
+  result hash: sha256:1384c5ac7550c2e5d713e9d5889ba6ceb144df5b467bf7c1d7b7c5429c715c77
 OK: regression correctly blocked (exit 1)
 ```
 
 (cost.total_usd fell 96.4% — and the gate still failed; that asymmetry is the product.)
 
-Reproducibility spot-check: consecutive red-example runs — and runs from a different
-checkout directory — produced byte-identical `report.json` and the same `result_hash`
-shown above (the report no longer embeds any absolute path).
+The 2026-10-02 run used a task-owned virtual environment, reused installed pytest,
+disabled unrelated global pytest plugins (`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`),
+and set a task-owned pytest `--basetemp`. `PYTHONPATH=src` pinned the worktree's
+source for both tests and demos. On Windows PowerShell, the source-pinned Make
+invocation was:
 
-Action logic local simulation (bash, `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY` pointed at
-temp files, same commands as action.yml): outputs file received `verdict=fail`,
+```powershell
+$env:PYTHONPATH='src'
+make ci PY=python 'SHELL=C:/Program Files/Git/bin/bash.exe'
+```
+
+Without this shell override, Windows Make may misinterpret the deliberate
+red-demo recipe.
+
+Reproducibility spot-check: red-demo reports from three separate task worktrees
+(main and the two diagnostic branches) were byte-identical and shared the hash
+above. The full suite also exercised repeated-run and relocated-input
+reproducibility (the report does not embed absolute paths).
+
+Historical Action logic local simulation (2026-08-02; not rerun on 2026-10-02):
+bash, `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY` pointed at temp files, same commands
+as action.yml. The outputs file received `verdict=fail`,
 `exit-code=1`, `result-hash=…`, report paths, `cli-exit=1`; summary file received the
 Markdown report; the enforce step maps `cli-exit=1` to a failed check.
+
+## Release package acceptance
+
+Build and check both archive types, then install the wheel into a fresh offline
+environment and verify its import, entrypoint, version, hash and green/red gates:
+
+```bash
+python -m pip install build
+python -m build --outdir dist
+python scripts/verify_dist.py dist --smoke
+```
+
+The v0.2.0 candidate on Windows Python 3.14.3 passed 353 tests in 1.17s on
+2026-10-02. Both green demos passed and the deliberate regression exited 1.
+Its report hashes are `34742875a2979772b7a3db015182e3a9e9753261273953dc286f6ab815072263`
+(rag), `042ad6047df0a03fb93f528c81c550964bb2a6081d0cfa25eeca36ed7e6e31d4`
+(extraction), and `432ccdf9bdb263f642d5607528f4b80cfe79bd15d0603fd543fa46ab78bd7b05`
+(red). The tool version is part of each report; these hashes differ from the
+historical 0.1.2 measurements above. Exact release receipts live in the ledger.
+Python 3.11 cost summation produces different rag/red hashes from Python 3.13+
+for these inputs; observed verdicts agree. Pin the Python version when comparing
+historical released result hashes. Main fixes [#69](https://github.com/Chris0Jeky/llm-release-gate/issues/69)
+and compares report bytes across the hosted matrix; see [numerical reproducibility](numerical-reproducibility.md).
+No historical release tag was rewritten. This is separate from input line-ending normalization.
+
+The verifier compares `LICENSE`, `RELICENSING.md` and `LICENSES/MIT.txt` bytes
+against the checkout in both archives, checks package metadata and zero runtime
+dependencies, and runs the installed wheel with isolated Python (`-I`). CI's
+`package` job runs the same acceptance and preserves the archives. The v0.2.0
+candidate fixes a reproduced wheel omission: `MANIFEST.in` supplied the sdist
+notices but did not put all notices in the wheel; explicit `license-files` does.
 
 ## Adding tests
 
@@ -81,3 +144,39 @@ exercises loading + wiring) with `mini_gate` overrides; drop to unit level for p
 (verdicts, hashing, schema validation). If you add a metric or scorer, test its
 *ownership* (no metric collisions), its applicability rules, and how it renders when
 unavailable.
+
+## Additive automation and bound-replay checks (unreleased main)
+
+`tests/test_automation_controls.py` covers scoped raw-byte limits and the opt-in
+diagnostic failure policy. `tests/test_request_binding.py` covers versioned request
+identity, stale/missing evidence, independent binding requirements, plan safety,
+legacy compatibility and assurance disclosures. `tests/test_bound_example.py`
+executes the synthetic demo and tests quoted Action flag transport in Bash.
+
+`make demo-bound` is repeatable and refuses stale evidence with exit 2. `make ci`
+now also runs this demo. The hosted matrix compares twelve report files plus a
+request plan and synthetic check receipt; the Action self-test adds bounded-input
+and required-binding acceptance/refusal. Earlier dated counts above remain
+historical measurements, not a count for current main.
+
+The package job's `scripts/verify_dist.py --smoke` also drives planning without
+fixtures, non-overwriting plans, bound replay, stale/downgrade/size refusal, and
+opt-in diagnostic failures through the installed wheel's isolated Python (`-I`).
+It retains the existing notice, metadata, zero-dependency and green/red checks.
+`tests/test_installed_smoke.py` mutation probes ensure wrong identities, generic
+exit-2 errors, overwritten plans and lost diagnostics cannot pass that verifier.
+Source example files are inputs only; subprocess imports must resolve inside the
+fresh virtual environment. See [qualification receipts](request-evidence-progress.md).
+
+## Publication and transferred-bundle integrity (unreleased main)
+
+`tests/test_output_safety.py` reproduces input/output alias destruction, late-render
+failures, write failures at every replacement position, and incomplete rollback.
+`tests/test_bundle_verification.py` checks exact artifact and canonical manifest
+hashes, strict decoding, pin mismatches, filesystem boundaries, relocation, and
+the separation of integrity from a recorded policy verdict.
+
+`make verify-demo` generates and checks all four bundles. `make ci` includes the
+same checks. The actual Action self-test checks emitted result/bundle hash pins;
+fresh-wheel acceptance exercises successful verification and tamper refusal.
+See [bundle verification](bundle-verification.md) for what is and is not proven.

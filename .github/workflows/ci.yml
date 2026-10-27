@@ -7,6 +7,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build distribution archives
+        run: |
+          python -m pip install build
+          python -m build --outdir dist
+      - name: Verify notices and fresh offline wheel install
+        run: python scripts/verify_dist.py dist --smoke
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-packages
+          path: dist/
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -46,6 +64,7 @@ jobs:
           thresholds: examples/rag-support-bot/thresholds.json
           pricing: examples/pricing.json
           out: out/action-green
+          max-input-bytes: "1048576"
           comment: "false"
 
       - name: Gate the deliberate regression (must fail)
@@ -62,9 +81,220 @@ jobs:
           out: out/action-red
           comment: "false"
 
+      - name: Reject an oversized input (must not produce a verdict)
+        id: oversize
+        continue-on-error: true
+        uses: ./
+        with:
+          dataset: examples/rag-support-bot/dataset.json
+          baseline: examples/rag-support-bot/baseline.json
+          candidate: examples/rag-support-bot/candidate.json
+          scorers: examples/rag-support-bot/scorers.json
+          thresholds: examples/rag-support-bot/thresholds.json
+          out: out/action-oversize
+          max-input-bytes: "1"
+          comment: "false"
+
+      - name: Gate synthetic request-bound replay (must pass)
+        id: bound
+        uses: ./
+        with:
+          dataset: examples/request-bound-replay/dataset.json
+          baseline: examples/request-bound-replay/baseline.json
+          candidate: examples/request-bound-replay/candidate.json
+          scorers: examples/request-bound-replay/scorers.json
+          thresholds: examples/request-bound-replay/thresholds.json
+          out: out/action-bound
+          require-request-binding: "true"
+          max-input-bytes: "1048576"
+          comment: "false"
+
+      - name: Refuse unbound configs under binding policy
+        id: unbound
+        continue-on-error: true
+        uses: ./
+        with:
+          dataset: examples/rag-support-bot/dataset.json
+          baseline: examples/rag-support-bot/baseline.json
+          candidate: examples/rag-support-bot/candidate.json
+          scorers: examples/rag-support-bot/scorers.json
+          thresholds: examples/rag-support-bot/thresholds.json
+          out: out/action-unbound
+          require-request-binding: "true"
+          comment: "false"
+
+      - name: Prepare adversarial pricing and model diagnostics
+        run: |
+          python - <<'PYCODE'
+          import json, shutil
+          from pathlib import Path
+          root = Path('out/action-log-inputs')
+          shutil.copytree('examples/rag-support-bot', root)
+          payload = 'v1\n::warning::injected diagnostic\r\n::add-mask::LRG_MASK_SENTINEL'
+          for side in ('baseline', 'candidate'):
+              path = root / f'{side}.json'
+              config = json.loads(path.read_text(encoding='utf-8'))
+              fixtures = root / config['provider_options']['fixtures']
+              replay = json.loads(fixtures.read_text(encoding='utf-8'))
+              replay['responses'] = {payload: replay['responses'][config['model']]}
+              config['model'] = payload
+              path.write_text(json.dumps(config))
+              fixtures.write_text(json.dumps(replay))
+          (root / 'pricing.json').write_text(json.dumps({'version': payload, 'currency': 'USD',
+              'models': {'other': {'input_per_mtok': 0, 'output_per_mtok': 0}}}))
+          (root / 'thresholds.json').write_text(json.dumps({'rules': [
+              {'metric': 'cost.total_usd', 'max_value': 1}]}))
+          # Tee the actual composite gate's encoded process stream to the runner
+          # and a file, retaining the CLI status for the Action's enforcement step.
+          import os
+          Path(os.environ['RUNNER_TEMP'], 'capture-gate.sh').write_text('''python() {
+            if [ "$1" = "-m" ] && [ "$2" = "llm_release_gate" ] && [ "$3" = "gate" ]; then
+              command python "$@" 2>&1 | tee "$RUNNER_TEMP/gate-diagnostics.log"
+              return "${PIPESTATUS[0]}"
+            fi
+            command python "$@"
+          }
+          ''', newline='\n')
+          PYCODE
+
+      - name: Gate workflow-command text as inert diagnostic data
+        id: log_safety
+        continue-on-error: true
+        uses: ./
+        env:
+          BASH_ENV: ${{ runner.temp }}/capture-gate.sh
+        with:
+          dataset: out/action-log-inputs/dataset.json
+          baseline: out/action-log-inputs/baseline.json
+          candidate: out/action-log-inputs/candidate.json
+          scorers: out/action-log-inputs/scorers.json
+          thresholds: out/action-log-inputs/thresholds.json
+          pricing: out/action-log-inputs/pricing.json
+          out: out/action-log-safety
+          comment: "false"
+
+      - name: Assert runner log data is inert and structured evidence is complete
+        env:
+          LOG_OUTCOME: ${{ steps.log_safety.outcome }}
+          LOG_VERDICT: ${{ steps.log_safety.outputs.verdict }}
+        run: |
+          python - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          assert os.environ['LOG_OUTCOME'] == 'failure'
+          assert os.environ['LOG_VERDICT'] == 'fail'
+          log = Path(os.environ['RUNNER_TEMP'], 'gate-diagnostics.log').read_text(encoding='utf-8')
+          assert '::warning::' not in log and '::add-mask::' not in log
+          assert r'\n' in log and 'LRG_MASK_SENTINEL' in log
+          report = json.loads(Path('out/action-log-safety/report.json').read_text(encoding='utf-8'))
+          payload = 'v1\n::warning::injected diagnostic\r\n::add-mask::LRG_MASK_SENTINEL'
+          assert report['inputs']['pricing_table']['version'] == payload
+          assert report['inputs']['candidate_config']['model'] == payload
+          assert payload in report['rules'][0]['message']
+          assert report['gate']['verdict'] == 'fail'
+          PYCODE
+
+      - name: Emit adversarial strings as literal outputs
+        id: literal_outputs
+        run: |
+          python - <<'PYCODE'
+          from llm_release_gate.github_io import emit_outputs
+          emit_outputs({'verdict': 'fail', 'literal': 'line1\ninjected=value\nverdict=pass\nlrg_output_0\n'})
+          PYCODE
+
+      - name: Assert runner parsed one literal value without forged outputs
+        env:
+          LITERAL_PAYLOAD: ${{ steps.literal_outputs.outputs.literal }}
+          LITERAL_VERDICT: ${{ steps.literal_outputs.outputs.verdict }}
+          INJECTED_OUTPUT: ${{ steps.literal_outputs.outputs.injected }}
+        run: |
+          python - <<'PYCODE'
+          import os
+          assert os.environ['LITERAL_PAYLOAD'] == 'line1\ninjected=value\nverdict=pass\nlrg_output_0\n'
+          assert os.environ['LITERAL_VERDICT'] == 'fail'
+          assert os.environ['INJECTED_OUTPUT'] == ''
+          print('Literal multiline output transport: PASS')
+          PYCODE
+
+      - name: Verify the Action's pinned evidence bundle
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ steps.bound.outputs.bundle-hash }}
+          EXPECTED_RESULT_HASH: ${{ steps.bound.outputs.result-hash }}
+        run: |
+          test -n "$EXPECTED_BUNDLE_HASH"
+          python -m llm_release_gate verify --bundle out/action-bound \
+            --expected-bundle-hash "$EXPECTED_BUNDLE_HASH" \
+            --expected-result-hash "$EXPECTED_RESULT_HASH" --require-pass --json
+
+      - name: Audit the pinned bundle under an independent consumer policy
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ steps.bound.outputs.bundle-hash }}
+          EXPECTED_RESULT_HASH: ${{ steps.bound.outputs.result-hash }}
+        run: |
+          policy=examples/request-bound-replay/consumer-policy.json
+          EXPECTED_POLICY_HASH=$(python -m llm_release_gate hash "$policy" | cut -d ' ' -f 1)
+          set +e
+          python -m llm_release_gate audit --bundle out/action-bound \
+            --thresholds "$policy" --expected-policy-hash "$EXPECTED_POLICY_HASH" \
+            --expected-bundle-hash "$EXPECTED_BUNDLE_HASH" \
+            --expected-result-hash "$EXPECTED_RESULT_HASH" --json > "$RUNNER_TEMP/consumer-audit.json"
+          code=$?
+          set -e
+          test "$code" -eq 1
+          python - "$RUNNER_TEMP/consumer-audit.json" <<'PYCODE'
+          import json, sys
+          with open(sys.argv[1], encoding='utf-8') as source:
+              audit = json.load(source)
+          assert audit['recorded_gate_verdict'] == 'pass'
+          assert audit['policy_verdict'] == 'fail'
+          assert all(audit['external_pins'].values())
+          assert audit['scores_recomputed'] is False
+          cost = next(rule for rule in audit['rules'] if rule['metric'] == 'cost.total_usd')
+          assert cost['checks'][0]['status'] == 'unavailable'
+          print('Pinned consumer policy refused a passing bundle with unavailable cost: PASS')
+          PYCODE
+
       - name: Assert outcomes
         run: |
           test "${{ steps.green.outputs.verdict }}" = "pass"
           test "${{ steps.red.outcome }}" = "failure"
           test "${{ steps.red.outputs.verdict }}" = "fail"
-          echo "action self-test OK: green passed, red was blocked"
+          test "${{ steps.oversize.outcome }}" = "failure"
+          test -z "${{ steps.oversize.outputs.verdict }}"
+          test -z "${{ steps.oversize.outputs.report-json }}"
+          test ! -e out/action-oversize/report.json
+          test "${{ steps.bound.outputs.verdict }}" = "pass"
+          test "${{ steps.unbound.outcome }}" = "failure"
+          test -z "${{ steps.unbound.outputs.verdict }}"
+          test -z "${{ steps.unbound.outputs.report-json }}"
+          test ! -e out/action-unbound/report.json
+          echo "action self-test OK: green/bound passed; red, oversized and unbound inputs blocked"
+
+  report-reproducibility:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: demo-reports-3.11
+          path: reports-3.11
+          digest-mismatch: error
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: demo-reports-3.13
+          path: reports-3.13
+          digest-mismatch: error
+      - name: Compare deterministic report bytes across Python versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for example in rag-support-bot extraction-api assistant-cheap-regression request-bound-replay; do
+            for format in json md html; do
+              cmp "reports-3.11/$example/report.$format" "reports-3.13/$example/report.$format"
+            done
+          done
+          cmp "reports-3.11/request-bound-replay/plan.json" "reports-3.13/request-bound-replay/plan.json"
+          cmp "reports-3.11/request-bound-replay/binding-check.json" "reports-3.13/request-bound-replay/binding-check.json"
+          echo "All twelve reports, request plan and binding receipt are byte-identical across Python 3.11 and 3.13"

@@ -1,6 +1,6 @@
 # Architecture
 
-One pipeline, five pinned inputs, one auditable verdict.
+One pipeline, five required inputs plus optional pricing, one auditable verdict.
 
 ```
  dataset.json     baseline.json    candidate.json   scorers.json  thresholds.json  pricing.json
@@ -25,7 +25,7 @@ One pipeline, five pinned inputs, one auditable verdict.
 
 | Module | Owns |
 |---|---|
-| `loading.py` | parsing + validation of the five inputs; every loader returns a line-ending-normalized JSON source sha256 |
+| `loading.py` | parsing + validation of the five required inputs plus optional pricing; every loader returns a line-ending-normalized JSON source sha256, except omitted optional pricing yields sha256 None via no_pricing |
 | `providers/` | `Provider` interface + registry; `fake.py` is the deterministic replay provider |
 | `adapters/` | `TaskAdapter` interface + registry; item → prompt fields, raw text → `ParsedOutput` |
 | `scorers/` | `Scorer` interface + registry + uniform aggregation; each metric has exactly one owner |
@@ -53,18 +53,36 @@ Registries are plain dicts populated at import; see `docs/extending.md`.
 
 ## Input schemas (by example)
 
+Input JSON and fake-provider fixtures are read from regular files as UTF-8.
+Missing, unreadable or non-regular files, invalid encoding or JSON, and interpreter
+JSON numeric/nesting limits produce a configuration error naming the input and
+path (exit 2). Fixtures use
+the same reader and source hashing as the other inputs; valid inputs retain
+their existing hashes. Files are read whole; there is no size cap unless
+`--max-input-bytes` is set, and then an oversize input exits 2
+([automation controls](automation-controls.md)).
+
 **Dataset** — `{"name", "version", "task", "items": [{"id", "input", "expected"}]}`.
 `task` selects the adapter. Grounded tasks: `input.question` + `input.documents[{id,text}]`,
 `expected.quality.must_contain/must_not_contain`, `expected.must_cite`,
-`expected.should_abstain`. Extraction: `input.text`, `expected.fields`.
+`expected.should_abstain`. Extraction: `input.text`, `expected.fields`. The `expected` sub-fields above are type-checked at load and a wrong shape is a configuration error (exit 2).
+`expected.must_cite` ids must be non-empty, non-whitespace strings; a blank id can never be
+cited, so it is a configuration error (exit 2) rather than a guaranteed citation failure.
+`input.question` (grounded tasks) and `input.text` (extraction) are required
+non-empty strings; an item missing its task's prompt input is a configuration
+error (exit 2), never an empty-prompt run. `input.documents` stays optional; when present
+(any task) its `{id,text}` shape and unique ids are checked at load (exit 2).
 
 **Run config** — `{"name", "provider", "model", "params", "prompt": {"system",
-"template"}, "provider_options"}`. Templates use `string.Template` syntax (`$question`,
-`$documents`, `$sources`, `$text`) so JSON braces never collide.
+"template"}, "provider_options"}`. Templates use `string.Template` syntax
+so JSON braces never collide. Placeholder fields are scoped per task: `rag` provides `$question`/`$documents`, `assistant` provides `$question`/`$sources`, `extraction` provides `$text`. A template referencing another task's field fails loudly as an unknown-field configuration error (exit 2). `prompt.system`, when
+present, must be a string; omitting it or using an empty string is valid.
+For the fake provider, `provider_options.fixtures` must be a non-empty string
+path, resolved relative to the run config's directory.
 
 **Fake provider fixtures** — `{"responses": {"<model>": {"<item_id>": {"text",
 "prompt_tokens?", "completion_tokens?", "latency_ms?", "error?"}}}}`. Omit token fields to
-simulate a provider that reports no usage; an `error` entry raises `ProviderError`.
+simulate a provider that reports no usage; an `error` entry raises `ProviderError`. `latency_ms`, when present, must be a finite non-negative number (NaN and ±Infinity are rejected as config errors).
 
 **Scorer config** — `{"scorers": [{"type", "options?"}]}`. Two scorers may not emit the
 same metric (validated at build time).
@@ -81,6 +99,16 @@ change.
 ## Verdict semantics
 
 - Rule breach at level `fail` → gate **fail** (exit 1). `warn` only annotates.
+- Integer-only threshold comparisons are exact, including percentage checks
+  (compared before division can round). Comparisons involving floats retain an
+  absolute tolerance of `1e-9` in the constraint's units: metric units for
+  absolute checks, percentage points for percentage checks with a nonzero baseline.
+- Zero-baseline percentage checks use **zero tolerance**. Both `0.0` and `-0.0`
+  count as zero; every representable positive candidate breaches a finite
+  `max_increase_pct`, including a cap of zero. Likewise, a negative candidate
+  breaches `max_drop_pct` from zero. Improvements pass. There is no magnitude
+  scale at zero that can distinguish float noise from a real tiny measurement,
+  so nonzero candidates are never silently normalized to zero.
 - A rule whose metric is unavailable applies its `on_unavailable` policy — default
   **fail** (fail-closed: a gate you cannot evaluate is not a passing gate).
 - A rule naming a metric nothing produces → configuration error (exit 2).
